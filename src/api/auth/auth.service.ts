@@ -1,0 +1,291 @@
+import { BadRequestException, HttpStatus, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
+import type { ConfigType } from '@nestjs/config';
+import * as bcrypt from 'bcrypt';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { dirname } from 'path';
+import { AuditLogService } from 'src/audit-log/audit-log.service';
+import { AuditLogEntry } from 'src/audit-log/audit-log.type';
+import { CountDto, IdDto } from 'src/common/dto/common.dto';
+import configuration from 'src/config/configuration';
+import { DatabaseService } from 'src/database/database.service';
+import { SseEmitterService } from 'src/events/sse/sse.service';
+import { JwtTokenService } from 'src/jwt-token/jwt-token.service';
+import { CustomLogger } from 'src/logger/custom-logger.service';
+import { RedisCacheService } from 'src/redis-cache/redis-cache.service';
+import * as K from 'src/common/constants';
+import { UserPermissionsDto } from 'src/common/dto/user-permission.dto';
+import { CREATE_SUPERADMIN_QUERY, GET_SUPERADMIN_PERMISSION_QUERY, USER_COUNT_QUERY } from './queries/initialization.query';
+import { CheckInitializationStatusResponse } from './dto/check-initialization.dto';
+import { InitializeSuperAdminDto, InitializeSuperAdminResponseDto } from './dto/initialize-superadmin.dto';
+import { LOG_USER_LOGIN_QUERY } from './queries/log-user-login.query';
+import { LoginRequestDto, LoginResponseDto, RefreshTokenResponseDto, UserInfoDto } from './dto/auth.dto';
+import { FETCH_USER_BY_USERNAME_QUERY } from './queries/user-login.query';
+import { FastifyReply } from 'fastify';
+
+@Injectable()
+export class AuthService {
+    constructor(
+        @Inject(configuration.KEY)
+        private readonly config: ConfigType<typeof configuration>,
+        private readonly db: DatabaseService<any>,
+        private readonly auditService: AuditLogService,
+        private readonly jwt: JwtTokenService,
+        private readonly redis: RedisCacheService,
+        private readonly sseEmitter: SseEmitterService,
+        private readonly logger: CustomLogger,
+    ) {
+        this.logger.setContext(AuthService.name);
+    }
+
+    private isBootstrapped(): boolean {
+        return existsSync(K.SETUP_LOCK_FILE);
+    }
+
+    private isValidPassword(password: string): boolean {
+        return RegExp(K.STRONG_PASSWORD).test(password);
+    }
+
+    private async getAuthToken(data: { loginId: string, userId: string, name: string, role: string }) {
+        try {
+            const { accessToken, refreshToken } = await this.jwt.generateTokens(data);
+
+        await this.redis.set(
+            data.loginId,
+            { accessToken, refreshToken },
+            this.config.jwt.refreshExpiry as string | number,
+        );
+
+            return { accessToken, refreshToken };
+        } catch (error) {
+            this.logger.error('Failed to get auth token', error);
+            throw error;
+        }
+    }
+
+    async checkInitializationStatus(): Promise<CheckInitializationStatusResponse> {
+        if (this.isBootstrapped()) {
+            return {
+                success: true,
+                statusCode: HttpStatus.OK,
+                message: 'Application has been initialized.',
+                data: { initialized: true },
+            };
+        }
+
+        try {
+            const result = await this.db.rawQuery(USER_COUNT_QUERY, [], CountDto);
+            return {
+                success: true,
+                statusCode: HttpStatus.OK,
+                message: 'Application initialization status retrieved successfully.',
+                data: { initialized: result[0].count > 0 },
+            };
+        } catch (error) {
+            this.logger.error('Failed to check initialization status', error);
+            throw error;
+        }
+    }
+
+    async initializeSuperAdmin(
+        dto: InitializeSuperAdminDto,
+        reply: FastifyReply
+    ): Promise<InitializeSuperAdminResponseDto> {
+        if (this.isBootstrapped()) {
+            throw new BadRequestException('System has already been bootstrapped.');
+        }
+
+        try {
+            const userCount = (await this.db.rawQuery(USER_COUNT_QUERY, [], CountDto))[0].count;
+
+            if (userCount > 0) {
+                throw new BadRequestException('Super Admin already exists.');
+            }
+
+            const { fullname, username, password } = dto;
+
+            if (!(this.isValidPassword(password))) {
+                throw new BadRequestException('Password does not meet strength requirements.');
+            }
+
+            const hashedPassword = await bcrypt.hash(password, K.PASSWORD_HASH_ROUNDS);
+
+            const createdUser = await this.db.rawQuery(
+                CREATE_SUPERADMIN_QUERY,
+                [fullname, username, hashedPassword],
+                IdDto,
+            );
+            const userId = createdUser[0].id;
+
+            const loginRecord = await this.db.rawQuery(LOG_USER_LOGIN_QUERY, [userId], IdDto);
+            const loginId = loginRecord[0].id;
+
+            const permissions = (
+                await this.db.rawQuery(GET_SUPERADMIN_PERMISSION_QUERY, [], UserPermissionsDto)
+            )[0].permissions;
+
+            await this.auditService.logAction(<AuditLogEntry>{
+                userId,
+                action: 'CREATE_SUPERADMIN',
+                entityId: userId,
+                entityType: 'User',
+                details: {
+                    username,
+                    fullname: createdUser[0].fullname,
+                    description: `Super Admin "${username}" created.`,
+                    timestamp: new Date().toISOString(),
+                },
+            });
+
+            mkdirSync(dirname(K.SETUP_LOCK_FILE), { recursive: true });
+            writeFileSync(K.SETUP_LOCK_FILE, `Bootstrapped at ${new Date().toISOString()}\n`);
+
+            this.sseEmitter.emitToAll('superadmin.created', {
+                initialized: this.isBootstrapped()
+            });
+
+            const { accessToken, refreshToken } = await this.getAuthToken({
+                loginId,
+                userId,
+                name: createdUser[0].fullname,
+                role: 'superadmin',
+            });
+
+            await this.setRefreshTokenCookie(reply, refreshToken);
+
+            return {
+                success: true,
+                statusCode: HttpStatus.CREATED,
+                message: 'System bootstrapped with Super Admin successfully.',
+                data: {
+                    accessToken,
+                    permissions,
+                },
+            };
+        } catch (error) {
+            this.logger.error('Failed to initialize superadmin', error);
+            throw error;
+        }
+    }
+
+    async userLogin(credentials: LoginRequestDto, reply: FastifyReply): Promise<LoginResponseDto> { 
+        const username = credentials.username.trim();
+        const password = credentials.password.trim();
+
+        try {
+            const users = await this.db.rawQuery(
+                FETCH_USER_BY_USERNAME_QUERY,
+                [username],
+                UserInfoDto
+            );
+
+            const user = users?.[0];
+
+            if (!user) {
+                this.logger.warn(`Login failed: User "${username}" not found.`);
+                throw new UnauthorizedException('Invalid credentials');
+            }
+
+            const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+            if (!isPasswordValid) {
+                this.logger.warn(
+                    `Login failed: Incorrect password for user "${username}".`,
+                );
+                throw new UnauthorizedException('Invalid credentials');
+            }
+
+            const loginRecords = await this.db.rawQuery(
+                LOG_USER_LOGIN_QUERY,
+                [user.id],
+                IdDto,
+            );
+
+            const { accessToken, refreshToken } = await this.getAuthToken({
+                loginId: loginRecords[0].id,
+                userId: user.id,
+                name: user.fullname,
+                role: user.role,
+            });
+
+            await this.setRefreshTokenCookie(reply, refreshToken);
+
+            return {
+                success: true,
+                statusCode: HttpStatus.OK,
+                message: 'Login successful',
+                data: {
+                    accessToken,
+                    permissions: user.permissions,
+                },
+            };
+        } catch (error) {
+            this.logger.error(`ailed to login with user '${username}'`, error);
+            throw error;
+        }
+    }
+
+    async refreshAccessToken(
+        token: string,
+        reply: FastifyReply,
+    ): Promise<RefreshTokenResponseDto> {
+        if (!token) {
+            throw new UnauthorizedException('Missing refresh token');
+        }
+
+        try {
+            const payload = await this.jwt.verifyToken(token, this.config.jwt.refreshSecret as string);
+            const cache = await this.redis.get(payload?.loginId);
+            
+            if (cache) {
+                const { accessToken, refreshToken } = await this.jwt.generateTokens(payload);
+                await this.redis.set(payload.loginId, { accessToken, refreshToken }, this.config.redis.ttl as string);
+
+                await this.setRefreshTokenCookie(reply, refreshToken);
+
+                return {
+                    success: true,
+                    statusCode: HttpStatus.OK,
+                    message: 'Token refreshed successfully',
+                    data: {
+                        accessToken,
+                    }
+                }
+            } else {
+                    throw new BadRequestException('Invalid or expired refresh token');
+            }
+        } catch (error) {
+            this.logger.error('Refreshing access token has been failed', error);
+            throw new UnauthorizedException('Refreshing access token has been failed');
+        }
+    }
+
+    private async setRefreshTokenCookie(reply: FastifyReply, token: string) {
+        reply.setCookie('refreshToken', token, {
+            httpOnly: true,
+            secure: true,
+            sameSite: 'strict',
+            path: '/v1/auth/refresh-token',
+            maxAge: +(this.config.jwt.refreshExpiry as string)
+        });
+    }
+
+    async logout(loginId: string, reply: FastifyReply): Promise<void> {
+        try {
+            await this.db.update({
+                table: 'user_login',
+                set: `logout_at = CURRENT_TIMESTAMP`,
+                where: `id = $1`,
+                variables: [loginId],
+            }, IdDto);
+
+            await this.redis.del(loginId);
+            await reply.clearCookie('refreshToken', {
+                path: '/v1/auth/refresh-token',
+            });
+
+            return;
+        } catch (error) {
+            this.logger.error('Failed to logout', error);
+            throw error;
+        }
+    }
+}
